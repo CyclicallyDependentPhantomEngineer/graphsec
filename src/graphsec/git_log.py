@@ -7,6 +7,7 @@ requirement is a ``git`` executable on PATH.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import re
 import subprocess
 from pathlib import Path
@@ -20,6 +21,11 @@ _PRETTY = f"{RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%aI{FIELD_SEP}%
 
 # "src/{old => new}/file.py" or "old.py => new.py"
 _BRACE_RENAME = re.compile(r"^(.*)\{(.*?) => (.*?)\}(.*)$")
+
+# "+0530" / "-08" rather than the "+05:30" that fromisoformat wants pre-3.11.
+_COMPACT_OFFSET = re.compile(r"([+-])(\d{2})(\d{2})$")
+
+log = logging.getLogger("graphsec.git")
 
 
 class GitError(RuntimeError):
@@ -89,6 +95,27 @@ def _parse_numstat(line: str) -> FileChange | None:
     )
 
 
+def parse_timestamp(value: str) -> dt.datetime | None:
+    """Parse a git ``%aI`` timestamp on every supported Python version.
+
+    ``datetime.fromisoformat`` only learned to accept the ``Z`` suffix and
+    colon-less UTC offsets in 3.11, and git prints UTC commits as
+    ``2024-01-08T10:00:00Z``. Without this normalisation every commit in a
+    UTC repository is unparseable on 3.10.
+    """
+    text = value.strip()
+    if not text:
+        return None
+    if text[-1] in "Zz":
+        text = f"{text[:-1]}+00:00"
+    else:
+        text = _COMPACT_OFFSET.sub(r"\1\2:\3", text)
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _parse_record(record: str) -> Commit | None:
     lines = record.split("\n")
     header = lines[0]
@@ -96,9 +123,8 @@ def _parse_record(record: str) -> Commit | None:
     if len(fields) < 5:
         return None
     sha, name, email, when, subject = fields[0], fields[1], fields[2], fields[3], fields[4]
-    try:
-        authored_at = dt.datetime.fromisoformat(when)
-    except ValueError:
+    authored_at = parse_timestamp(when)
+    if authored_at is None:
         return None
     changes = []
     for line in lines[1:]:
@@ -140,12 +166,26 @@ def read_commits(
 
     raw = _run(repo, args)
     commits = []
+    skipped = 0
     for record in raw.split(RECORD_SEP):
         if not record.strip():
             continue
         commit = _parse_record(record)
-        if commit is not None:
-            commits.append(commit)
+        if commit is None:
+            skipped += 1
+            continue
+        commits.append(commit)
+
+    if skipped:
+        # Silently returning an empty history would read as "this repository is
+        # clean", which is the most dangerous answer this tool can give.
+        message = "skipped %d unparseable commit record(s) in %s"
+        if not commits:
+            raise GitError(
+                f"read {skipped} commit record(s) from {repo} but could not parse any; "
+                "the git log format is not what this version expects"
+            )
+        log.warning(message, skipped, repo)
     return commits
 
 
