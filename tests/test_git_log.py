@@ -134,3 +134,27 @@ def test_parse_numstat_handles_binary():
     assert change is not None
     assert change.binary
     assert change.churn == 0
+
+
+def test_output_cap_is_enforced_while_reading_not_after(tiny_repo: Path):
+    """The cap must bound the peak allocation, not just the returned string."""
+    with pytest.raises(git_log.GitError, match="produced more than"):
+        git_log._run(tiny_repo, ["log", "--format=%H"], max_bytes=8)
+
+
+def test_truncatable_reads_return_a_prefix_instead_of_raising(tiny_repo: Path):
+    out = git_log._run(tiny_repo, ["log", "--format=%H"], max_bytes=8, truncate_ok=True)
+    assert len(out) == 8
+
+
+def test_history_read_refuses_a_partial_log(tiny_repo: Path, monkeypatch):
+    """A silently partial history is the failure this tool must never produce."""
+    monkeypatch.setattr(git_log, "MAX_LOG_BYTES", 16)
+    with pytest.raises(git_log.GitError, match="narrow the scan"):
+        git_log.read_history(tiny_repo)
+
+
+def test_diff_reads_survive_undecodable_bytes(tiny_repo: Path):
+    """git output is decoded explicitly, so a non-UTF-8 locale cannot break it."""
+    head = git_log.read_commits(tiny_repo, max_commits=1)[0]
+    assert isinstance(git_log.show_added_lines(tiny_repo, head.sha), str)
