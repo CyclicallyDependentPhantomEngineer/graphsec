@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,47 @@ def test_added_lines_by_file(planted_repo: Path):
     ]
     # The "+++ b/<path>" header itself must not leak into the added text.
     assert "+++" not in by_file["src/auth/session.py"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "2024-01-08T10:00:00Z",  # git's rendering of a UTC commit
+        "2024-01-08T10:00:00z",
+        "2024-01-08T10:00:00+00:00",
+        "2024-01-08T15:30:00+0530",  # colon-less offset
+        "2024-01-08T15:30:00+05:30",
+    ],
+)
+def test_parse_timestamp_accepts_every_git_offset_form(raw):
+    """fromisoformat only handles Z and colon-less offsets from 3.11 onward."""
+    parsed = git_log.parse_timestamp(raw)
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+    assert parsed.astimezone(dt.timezone.utc).hour == 10
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "not-a-date", "2024-13-45T99:99:99Z"])
+def test_parse_timestamp_rejects_garbage(raw):
+    assert git_log.parse_timestamp(raw) is None
+
+
+def test_parse_record_handles_utc_z_suffix():
+    record = (
+        "abc123\x1fAna\x1fana@example.com\x1f2024-01-08T10:00:00Z\x1finitial commit\n"
+        "1\t0\ta.py"
+    )
+    commit = git_log._parse_record(record)
+    assert commit is not None
+    assert commit.authored_at.utcoffset() == dt.timedelta(0)
+    assert commit.changes[0].path == "a.py"
+
+
+def test_read_commits_raises_when_nothing_parses(tiny_repo: Path, monkeypatch):
+    """An unreadable log must not masquerade as a repository with no history."""
+    monkeypatch.setattr(git_log, "parse_timestamp", lambda value: None)
+    with pytest.raises(git_log.GitError, match="could not parse any"):
+        git_log.read_commits(tiny_repo)
 
 
 @pytest.mark.parametrize(
