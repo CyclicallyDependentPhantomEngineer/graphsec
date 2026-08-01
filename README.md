@@ -12,10 +12,40 @@ whose names are one keystroke away from something popular.
 It needs nothing but `git` and the repository itself — no build, no language
 server, no network, no prior training data. Point it at a checkout and it works.
 
+## TL;DR
+
+```bash
+pip install graphsec              # networkx + numpy only
+graphsec scan /path/to/repo       # text report of what looks wrong
 ```
-pip install graphsec
-graphsec scan /path/to/repo
+
+Three things worth knowing before the first run:
+
+1. **Give it full history.** `git clone` is fine; a shallow clone or a CI
+   checkout without `fetch-depth: 0` has no topology to analyse and will report
+   almost nothing.
+2. **`--deep` is a different tool.** Without it, graphsec reads only commit
+   metadata (who, when, which files, how many lines) and is fast — about 1.5 s
+   for 174 commits. With it, it also fetches and scans diffs, which is where
+   `curl … | sh` and embedded credentials get caught, and the cost grows with
+   history rather than tree size.
+3. **Scores are relative to the repository being scanned**, not absolute. `0.9`
+   means "unusual for this repo", not "malicious". Read `evidence` before acting.
+
+```bash
+graphsec scan .                              # everything, text
+graphsec scan . --deep                       # + content scan of diffs
+graphsec scan . -f json -o findings.json     # machine-readable
+graphsec scan . -f sarif --fail-on high      # CI gate, exit 1 on high severity
+graphsec detectors                           # what can fire, and why
 ```
+
+Optional extra: `pip install 'graphsec[ml]'` adds scikit-learn, which swaps the
+structural detector's fallback scorer for an IsolationForest. Everything else is
+identical either way.
+
+Full walkthrough of the graph, the features and every threshold:
+**[docs/how-it-works.md](docs/how-it-works.md)**.
 
 ```
 graphsec scan of /path/to/repo
@@ -73,7 +103,9 @@ number of meaningless edges.
 | `dependency` | New dependencies pulled from URLs or VCS refs, names one edit away from popular packages, dependencies introduced alongside CI changes |
 | `payload` | Added content matching remote-script execution, dynamic eval of encoded data, reverse shells, credential exfiltration, high-entropy strings (**deep mode only**) |
 
-List them at runtime with `graphsec detectors`.
+List them at runtime with `graphsec detectors`. Each detector's exact statistic,
+thresholds and suppression rules are documented in
+[docs/how-it-works.md](docs/how-it-works.md#stage-4--the-detectors).
 
 ### Structural features
 
@@ -83,7 +115,12 @@ concentration, co-change degree and weight, fraction of coupling that leaves its
 own directory, weighted clustering, PageRank, k-core number, betweenness,
 import in/out degree, fraction of coupling unexplained by imports, and path
 sensitivity. Betweenness switches to pivot sampling above 96 nodes so large
-repositories stay fast.
+repositories stay fast, and PageRank is computed directly with numpy rather than
+through scipy so the minimal install works and scores do not change depending on
+which optional packages are present.
+
+Each feature is defined, with the anomaly it exposes, in
+[docs/how-it-works.md](docs/how-it-works.md#stage-3--per-file-features).
 
 ## Usage
 
