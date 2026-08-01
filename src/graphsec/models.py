@@ -92,6 +92,9 @@ class ScanResult:
     author_count: int
     findings: list[Finding] = field(default_factory=list)
     graph_stats: dict[str, Any] = field(default_factory=dict)
+    # Conditions that limited the scan. Anything here means the report covers
+    # less than the whole repository, which a reader has to know about.
+    warnings: list[str] = field(default_factory=list)
 
     def extend(self, findings: Iterable[Finding]) -> None:
         self.findings.extend(findings)
@@ -112,5 +115,6 @@ class ScanResult:
                 "low": sum(1 for f in self.findings if f.severity == "low"),
             },
             "graph": self.graph_stats,
+            "warnings": list(self.warnings),
             "findings": [f.to_dict() for f in self.sorted_findings()],
         }

@@ -5,10 +5,19 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 
+from .git_log import sanitize
 from .graph import RepoGraph, node_name
 from .models import ScanResult
 
 SEVERITY_MARK = {"high": "!!", "medium": "! ", "low": "  "}
+
+# Attributes injected through a crafted path would otherwise change how
+# Graphviz renders -- and what it reads -- when the DOT file is processed.
+_DOT_UNSAFE = str.maketrans({'"': "'", "\\": "/"})
+
+
+def _dot_quote(name: str) -> str:
+    return sanitize(name).translate(_DOT_UNSAFE)
 
 
 def to_json(result: ScanResult, *, indent: int = 2) -> str:
@@ -77,6 +86,9 @@ def to_text(result: ScanResult, *, limit: int = 40, color: bool = False) -> str:
         f"(high={summary['high']} medium={summary['medium']} low={summary['low']})",
         "",
     ]
+    for warning in result.warnings:
+        lines.insert(-1, f"  WARNING: {sanitize(warning)}")
+
     findings = result.sorted_findings()[:limit]
     if not findings:
         lines.append("  no anomalies above threshold")
@@ -89,9 +101,11 @@ def to_text(result: ScanResult, *, limit: int = 40, color: bool = False) -> str:
             shade = {"high": "31", "medium": "33", "low": "37"}[finding.severity]
             head = f"\033[{shade}m{head}\033[0m"
         lines.append(head)
-        lines.append(f"     {finding.message}")
+        # Messages and evidence embed repository-controlled text; escape
+        # sequences in it would otherwise rewrite the operator's report.
+        lines.append(f"     {sanitize(finding.message)}")
         for key, value in list(finding.evidence.items())[:4]:
-            lines.append(f"     - {key}: {value}")
+            lines.append(f"     - {sanitize(str(key))}: {sanitize(str(value))}")
         lines.append("")
 
     hidden = len(result.findings) - len(findings)
@@ -108,19 +122,20 @@ def to_dot(repo_graph: RepoGraph, *, highlight: Iterable[str] = ()) -> str:
         if data.get("type") != "file":
             continue
         name = node_name(node)
-        attrs = [f'label="{name}"']
+        safe = _dot_quote(name)
+        attrs = [f'label="{safe}"']
         if name in highlight:
             attrs.append('color="red"')
             attrs.append('penwidth=2')
         elif data.get("sensitivity", 0.0) >= 0.7:
             attrs.append('color="orange"')
-        lines.append(f'  "{name}" [{" ".join(attrs)}];')
+        lines.append(f'  "{safe}" [{" ".join(attrs)}];')
     for left, right, data in repo_graph.graph.edges(data=True):
         if data.get("kind") != "cochange":
             continue
         weight = data.get("weight", 1.0)
         lines.append(
-            f'  "{node_name(left)}" -- "{node_name(right)}" '
+            f'  "{_dot_quote(node_name(left))}" -- "{_dot_quote(node_name(right))}" '
             f'[penwidth={min(1 + weight / 4, 6):.1f}];'
         )
     lines.append("}")

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import Commit, FileChange
@@ -17,13 +19,44 @@ from .models import Commit, FileChange
 RECORD_SEP = "\x1e"
 FIELD_SEP = "\x1f"
 
-_PRETTY = f"{RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%aI{FIELD_SEP}%s"
+# The trailing separator terminates the subject, so a record can be split on
+# FIELD_SEP alone. Without it the header had to be taken as the first line of
+# the record, and an author identity containing a newline silently destroyed
+# the record -- which let a commit hide itself from every detector.
+_PRETTY = (
+    f"{RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%aI{FIELD_SEP}%s{FIELD_SEP}"
+)
+_HEADER_FIELDS = 5
+
+_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 # "src/{old => new}/file.py" or "old.py => new.py"
 _BRACE_RENAME = re.compile(r"^(.*)\{(.*?) => (.*?)\}(.*)$")
 
 # "+0530" / "-08" rather than the "+05:30" that fromisoformat wants pre-3.11.
 _COMPACT_OFFSET = re.compile(r"([+-])(\d{2})(\d{2})$")
+
+# C0 controls and DEL. Tab and newline are stripped too: every field these are
+# applied to is rendered as a single line in reports.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+# Repository-local configuration that git would otherwise execute on our
+# behalf. A scanned repository is untrusted input by definition, and several of
+# these keys are arbitrary command hooks: core.fsmonitor and
+# diff.<driver>.textconv both run during a plain `git log`/`git show`.
+_SAFE_CONFIG = (
+    "core.fsmonitor=",
+    "core.alternateRefsCommand=",
+    "core.sshCommand=",
+    "core.pager=cat",
+    "core.quotePath=true",
+    "diff.external=",
+    "uploadpack.packObjectsHook=",
+    "protocol.ext.allow=never",
+)
+
+# Diff-producing commands must also be told not to shell out per-file.
+NO_DIFF_PROGRAMS = ("--no-textconv", "--no-ext-diff")
 
 log = logging.getLogger("graphsec.git")
 
@@ -32,13 +65,46 @@ class GitError(RuntimeError):
     """Raised when git is missing, or the path is not a repository."""
 
 
+def sanitize(text: str) -> str:
+    """Drop control characters from repository-supplied text.
+
+    Author names, emails, subjects and paths are attacker-controlled whenever
+    the scanned repository is untrusted. Left intact they can rewrite a
+    terminal report with ANSI escapes or forge whole lines with newlines.
+    """
+    return _CONTROL.sub("", text)
+
+
+def _git_env() -> dict[str, str]:
+    env = dict(os.environ)
+    # Config from the environment is as dangerous as config from the repository.
+    for name in list(env):
+        if name.startswith("GIT_CONFIG") or name in {
+            "GIT_EXTERNAL_DIFF",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PROXY_COMMAND",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+        }:
+            del env[name]
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
 def _run(repo: Path, args: list[str]) -> str:
+    command = ["git", "-C", str(repo)]
+    for setting in _SAFE_CONFIG:
+        command += ["-c", setting]
+    command += args
     try:
         proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
+            command,
             capture_output=True,
             text=True,
             check=False,
+            env=_git_env(),
         )
     except FileNotFoundError as exc:  # pragma: no cover - environment dependent
         raise GitError("git executable not found on PATH") from exc
@@ -83,7 +149,7 @@ def _parse_numstat(line: str) -> FileChange | None:
     binary = ins_raw == "-" or del_raw == "-"
     insertions = 0 if binary else int(ins_raw or 0)
     deletions = 0 if binary else int(del_raw or 0)
-    path, old_path = _split_rename(spec)
+    path, old_path = _split_rename(sanitize(spec))
     if not path:
         return None
     return FileChange(
@@ -117,46 +183,76 @@ def parse_timestamp(value: str) -> dt.datetime | None:
 
 
 def _parse_record(record: str) -> Commit | None:
-    lines = record.split("\n")
-    header = lines[0]
-    fields = header.split(FIELD_SEP)
-    if len(fields) < 5:
+    """Parse one ``RECORD_SEP``-delimited record, or return None if malformed.
+
+    Splitting on the field separator rather than on lines is what makes this
+    robust: git accepts a carriage return inside an author identity and renders
+    it as a newline, so a line-oriented parse can be broken by any committer.
+    """
+    fields = record.split(FIELD_SEP, _HEADER_FIELDS)
+    if len(fields) <= _HEADER_FIELDS:
         return None
-    sha, name, email, when, subject = fields[0], fields[1], fields[2], fields[3], fields[4]
+    sha, name, email, when, subject, body = fields
+    if not _SHA.match(sha.strip()):
+        return None
     authored_at = parse_timestamp(when)
     if authored_at is None:
         return None
+
     changes = []
-    for line in lines[1:]:
-        line = line.strip("\n")
+    for line in body.split("\n"):
         if not line.strip():
             continue
         change = _parse_numstat(line)
         if change is not None:
             changes.append(change)
+
     return Commit(
-        sha=sha,
-        author_name=name,
-        author_email=email.lower(),
+        sha=sha.strip(),
+        author_name=sanitize(name),
+        author_email=sanitize(email).lower(),
         authored_at=authored_at,
-        subject=subject,
+        subject=sanitize(subject),
         changes=tuple(changes),
     )
 
 
-def read_commits(
+@dataclass(frozen=True)
+class History:
+    """Parsed history plus what had to be discarded to produce it."""
+
+    commits: list[Commit]
+    skipped: int = 0
+
+    @property
+    def warnings(self) -> list[str]:
+        if not self.skipped:
+            return []
+        return [
+            f"{self.skipped} commit record(s) could not be parsed and were excluded "
+            "from the analysis; those commits were not examined by any detector"
+        ]
+
+
+def read_history(
     repo: str | Path,
     *,
     max_commits: int | None = None,
     since: str | None = None,
     include_merges: bool = False,
-) -> list[Commit]:
-    """Return commits newest-first with per-file insertion/deletion counts."""
+) -> History:
+    """Read commits newest-first, reporting how many records were unusable."""
     repo = Path(repo)
     if not is_git_repo(repo):
         raise GitError(f"{repo} is not a git repository")
 
-    args = ["log", "--numstat", "--date=iso-strict", f"--pretty=format:{_PRETTY}"]
+    args = [
+        "log",
+        "--numstat",
+        "--date=iso-strict",
+        f"--pretty=format:{_PRETTY}",
+        *NO_DIFF_PROGRAMS,
+    ]
     if not include_merges:
         args.append("--no-merges")
     if max_commits:
@@ -177,25 +273,44 @@ def read_commits(
         commits.append(commit)
 
     if skipped:
-        # Silently returning an empty history would read as "this repository is
-        # clean", which is the most dangerous answer this tool can give.
-        message = "skipped %d unparseable commit record(s) in %s"
+        # A dropped record is a commit no detector ever sees, so this is never
+        # merely cosmetic: it is exactly what an evasive commit would produce.
         if not commits:
             raise GitError(
                 f"read {skipped} commit record(s) from {repo} but could not parse any; "
                 "the git log format is not what this version expects"
             )
-        log.warning(message, skipped, repo)
-    return commits
+        log.warning("skipped %d unparseable commit record(s) in %s", skipped, repo)
+    return History(commits=commits, skipped=skipped)
+
+
+def read_commits(
+    repo: str | Path,
+    *,
+    max_commits: int | None = None,
+    since: str | None = None,
+    include_merges: bool = False,
+) -> list[Commit]:
+    """Return commits newest-first with per-file insertion/deletion counts."""
+    return read_history(
+        repo,
+        max_commits=max_commits,
+        since=since,
+        include_merges=include_merges,
+    ).commits
 
 
 def list_files(repo: str | Path) -> list[str]:
-    """Return tracked paths at HEAD."""
+    """Return tracked paths at HEAD.
+
+    ``-z`` disables git's own path quoting, so these arrive as raw bytes and
+    are sanitised here rather than trusted.
+    """
     try:
         raw = _run(Path(repo), ["ls-files", "-z"])
     except GitError:
         return []
-    return [p for p in raw.split("\0") if p]
+    return [sanitize(p) for p in raw.split("\0") if p]
 
 
 def show_added_lines(
@@ -206,7 +321,7 @@ def show_added_lines(
     max_bytes: int = 400_000,
 ) -> str:
     """Return the added-line text of a commit, truncated for safety."""
-    args = ["show", "--format=", "--unified=0", "--no-color", sha]
+    args = ["show", "--format=", "--unified=0", "--no-color", *NO_DIFF_PROGRAMS, sha]
     if path:
         args += ["--", path]
     try:
@@ -232,7 +347,8 @@ def added_lines_by_file(
     """
     try:
         diff = _run(
-            Path(repo), ["show", "--format=", "--unified=0", "--no-color", sha]
+            Path(repo),
+            ["show", "--format=", "--unified=0", "--no-color", *NO_DIFF_PROGRAMS, sha],
         )
     except GitError:
         return {}
@@ -241,7 +357,7 @@ def added_lines_by_file(
     current: str | None = None
     for line in diff.split("\n"):
         if line.startswith("+++ "):
-            target = line[4:].strip()
+            target = sanitize(line[4:].strip())
             current = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
             continue
         if line.startswith("--- ") or line.startswith("@@"):
@@ -254,6 +370,8 @@ def added_lines_by_file(
 def file_blob(repo: str | Path, sha: str, path: str, *, max_bytes: int = 200_000) -> str:
     """Return file contents at a revision, or an empty string if unavailable."""
     try:
-        return _run(Path(repo), ["show", f"{sha}:{path}"])[:max_bytes]
+        return _run(
+            Path(repo), ["show", *NO_DIFF_PROGRAMS, f"{sha}:{path}"]
+        )[:max_bytes]
     except GitError:
         return ""
