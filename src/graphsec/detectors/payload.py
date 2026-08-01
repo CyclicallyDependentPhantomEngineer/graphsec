@@ -63,6 +63,26 @@ PATTERNS: tuple[tuple[str, re.Pattern[str], float], ...] = (
 
 _CANDIDATE_TOKEN = re.compile(r"[A-Za-z0-9+/=_\-]{32,}")
 
+# A quoted literal long enough to be a credential, and a bare token long enough
+# to be one. Everything around them -- the variable name, the surrounding call --
+# is what makes a finding reviewable, so only the value itself is removed.
+_QUOTED_VALUE = re.compile(r"(['\"])([A-Za-z0-9+/=_\-]{16,})\1")
+_BARE_TOKEN = re.compile(r"(?<![A-Za-z0-9+/=_\-])([A-Za-z0-9+/=_\-]{28,})")
+
+
+def redact_secrets(text: str) -> str:
+    """Strip credential-shaped values out of text that will be reported.
+
+    A finding travels into JSON and SARIF artifacts, and the documented CI
+    recipe uploads SARIF to code scanning. Copying the secret we just found
+    into that artifact would move it somewhere new rather than protect it.
+    """
+
+    quoted = _QUOTED_VALUE.sub(
+        lambda m: f"{m.group(1)}<redacted:{len(m.group(2))} chars>{m.group(1)}", text
+    )
+    return _BARE_TOKEN.sub(lambda m: f"<redacted:{len(m.group(1))} chars>", quoted)
+
 
 def shannon_entropy(text: str) -> float:
     if not text:
@@ -123,7 +143,10 @@ class PayloadDetector(Detector):
                                 f"{commit.short_sha} adds content matching {kind} "
                                 f"in {path} ({commit.author_email})"
                             ),
-                            evidence={**base, "snippet": match.group(0)[:160]},
+                            evidence={
+                                **base,
+                                "snippet": redact_secrets(match.group(0)[:160]),
+                            },
                         )
                     )
 

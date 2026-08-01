@@ -274,6 +274,14 @@ reverse shells, credential exfiltration, `base64` decoding, history rewriting,
 hardcoded secrets. Plus a Shannon-entropy check on long tokens (threshold 4.6
 bits/char), skipped inside lockfiles, whose checksums are high-entropy by nature.
 
+Credential-shaped values are redacted out of the reported snippet before it
+reaches a finding: a quoted literal of 16 or more characters, or a bare token of
+28 or more, becomes `<redacted:N chars>`. The surrounding context — the variable
+name, the call it sits in — is what makes the finding reviewable and is kept.
+Findings travel into JSON and SARIF, and the documented CI recipe uploads SARIF
+to code scanning, so copying a discovered secret into one would move it
+somewhere new rather than protect it.
+
 These are regex patterns. They are the least clever part of the tool and the most
 prone to false positives — graphsec's own source matches several of its own
 rules, correctly, because those strings really are in the diff.
