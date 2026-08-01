@@ -84,13 +84,30 @@ def test_parse_timestamp_rejects_garbage(raw):
 
 def test_parse_record_handles_utc_z_suffix():
     record = (
-        "abc123\x1fAna\x1fana@example.com\x1f2024-01-08T10:00:00Z\x1finitial commit\n"
+        "abc1234\x1fAna\x1fana@example.com\x1f2024-01-08T10:00:00Z\x1finitial commit\x1f\n"
         "1\t0\ta.py"
     )
     commit = git_log._parse_record(record)
     assert commit is not None
     assert commit.authored_at.utcoffset() == dt.timedelta(0)
     assert commit.changes[0].path == "a.py"
+
+
+def test_parse_record_survives_newline_in_author_identity():
+    """A carriage return in an identity is rendered as a newline by git."""
+    record = (
+        "abc1234\x1fAna\x1fana\nfake-line@example.com\x1f2024-01-08T10:00:00Z"
+        "\x1finitial commit\x1f\n1\t0\ta.py"
+    )
+    commit = git_log._parse_record(record)
+    assert commit is not None
+    assert commit.author_email == "anafake-line@example.com"
+    assert commit.changes[0].path == "a.py"
+
+
+def test_parse_record_rejects_a_non_sha_first_field():
+    record = "not-a-sha\x1fAna\x1fa@b.com\x1f2024-01-08T10:00:00Z\x1fsubject\x1f\n"
+    assert git_log._parse_record(record) is None
 
 
 def test_read_commits_raises_when_nothing_parses(tiny_repo: Path, monkeypatch):

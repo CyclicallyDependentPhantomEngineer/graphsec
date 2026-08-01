@@ -19,10 +19,14 @@ def load_graph(
     max_commits: int | None = None,
     since: str | None = None,
     with_imports: bool = True,
+    warnings: list[str] | None = None,
 ) -> RepoGraph:
     """Read history and build the repository graph."""
     root = git_log.repo_root(repo)
-    commits = git_log.read_commits(root, max_commits=max_commits, since=since)
+    history = git_log.read_history(root, max_commits=max_commits, since=since)
+    commits = history.commits
+    if warnings is not None:
+        warnings.extend(history.warnings)
     tracked = set(git_log.list_files(root))
 
     imports = None
@@ -47,8 +51,13 @@ def scan(
 ) -> ScanResult:
     """Run the full pipeline against ``repo`` and return the findings."""
     root = git_log.repo_root(repo)
+    warnings: list[str] = []
     repo_graph = load_graph(
-        root, max_commits=max_commits, since=since, with_imports=with_imports
+        root,
+        max_commits=max_commits,
+        since=since,
+        with_imports=with_imports,
+        warnings=warnings,
     )
 
     result = ScanResult(
@@ -57,6 +66,7 @@ def scan(
         file_count=len(repo_graph.files),
         author_count=len(repo_graph.authors),
         graph_stats=repo_graph.stats(),
+        warnings=warnings,
     )
 
     ctx = DetectorContext(repo=root, repo_graph=repo_graph, deep=deep)

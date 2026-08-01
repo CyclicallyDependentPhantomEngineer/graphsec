@@ -54,6 +54,31 @@ Three details matter:
   raises rather than returning an empty list — a scanner that reports "no
   findings" because it could not read the log is worse than one that crashes.
 
+### Running against untrusted repositories
+
+A repository you are scanning because you do not trust it is hostile input, and
+git will happily execute parts of it on your behalf. `core.fsmonitor`,
+`diff.<driver>.textconv` and `diff.external` are all arbitrary command hooks
+that fire during an ordinary `git log` or `git show`. Every git invocation
+therefore neutralises them explicitly:
+
+```
+git -C <repo> -c core.fsmonitor= -c diff.external= -c core.pager=cat \
+    -c core.quotePath=true -c protocol.ext.allow=never … --no-textconv --no-ext-diff
+```
+
+`GIT_CONFIG_NOSYSTEM=1` is set, and `GIT_CONFIG_*`, `GIT_EXTERNAL_DIFF`,
+`GIT_SSH*`, `GIT_PROXY_COMMAND` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` are
+removed from the environment, since configuration from the environment is as
+dangerous as configuration from the repository.
+
+Everything git *reports* is untrusted too. Author names, emails, subjects and
+paths are stripped of control characters before use: left intact they can
+rewrite a terminal report with ANSI escapes, and a newline inside an author
+identity used to break the record parser badly enough to delete that commit from
+the analysis. Records are split on the field separator rather than on lines
+precisely so that no committer can hide a commit from the scanner.
+
 ## Stage 2 — the graph
 
 [`graph.py`](../src/graphsec/graph.py) builds one undirected heterogeneous graph
