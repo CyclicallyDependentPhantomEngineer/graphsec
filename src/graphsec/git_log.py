@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +59,14 @@ _SAFE_CONFIG = (
 # Diff-producing commands must also be told not to shell out per-file.
 NO_DIFF_PROGRAMS = ("--no-textconv", "--no-ext-diff")
 
+# Ceilings on how much of git's output is ever held in memory. The history read
+# refuses to continue past its limit, because a silently partial history is the
+# same failure as an unreadable one; diffs may be truncated, since a bounded
+# prefix of a diff is still useful evidence.
+MAX_LOG_BYTES = 256 * 1024 * 1024
+MAX_DIFF_BYTES = 8 * 1024 * 1024
+_CHUNK_SIZE = 1 << 16
+
 log = logging.getLogger("graphsec.git")
 
 
@@ -93,24 +102,71 @@ def _git_env() -> dict[str, str]:
     return env
 
 
-def _run(repo: Path, args: list[str]) -> str:
+def _run(
+    repo: Path,
+    args: list[str],
+    *,
+    max_bytes: int | None = None,
+    truncate_ok: bool = False,
+) -> str:
+    """Run git and return its stdout, reading incrementally under a byte cap.
+
+    Buffering the whole of git's output first and slicing afterwards is no
+    protection at all: the peak allocation is the full output either way, and a
+    repository chooses how large that is. Reading in chunks and killing the
+    child at the limit is what actually bounds it.
+
+    ``max_bytes`` defaults to ``MAX_LOG_BYTES`` at call time rather than through
+    a default argument, so adjusting the module constant takes effect.
+    """
+    if max_bytes is None:
+        max_bytes = MAX_LOG_BYTES
     command = ["git", "-C", str(repo)]
     for setting in _SAFE_CONFIG:
         command += ["-c", setting]
     command += args
+
+    chunks: list[bytes] = []
+    remaining = max_bytes
+    truncated = False
     try:
-        proc = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=_git_env(),
-        )
+        with tempfile.TemporaryFile() as errors:
+            proc = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=errors, env=_git_env()
+            )
+            with proc.stdout as stream:  # type: ignore[union-attr]
+                while True:
+                    chunk = stream.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    if len(chunk) > remaining:
+                        chunks.append(chunk[:remaining])
+                        truncated = True
+                        proc.kill()
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+            returncode = proc.wait()
+            errors.seek(0)
+            stderr = errors.read().decode("utf-8", "replace")
     except FileNotFoundError as exc:  # pragma: no cover - environment dependent
         raise GitError("git executable not found on PATH") from exc
-    if proc.returncode != 0:
-        raise GitError(proc.stderr.strip() or f"git {' '.join(args)} failed")
-    return proc.stdout
+
+    # Decoding explicitly rather than through text=True also avoids depending on
+    # the locale encoding, which is not UTF-8 on every runner.
+    out = b"".join(chunks).decode("utf-8", "replace")
+
+    if truncated:
+        if not truncate_ok:
+            raise GitError(
+                f"git {args[0]} produced more than {max_bytes} bytes for {repo}; "
+                "narrow the scan with --since or --max-commits"
+            )
+        log.warning("truncated git %s output at %d bytes in %s", args[0], max_bytes, repo)
+        return out
+    if returncode != 0:
+        raise GitError(stderr.strip() or f"git {' '.join(args)} failed")
+    return out
 
 
 def is_git_repo(path: str | Path) -> bool:
@@ -325,7 +381,7 @@ def show_added_lines(
     if path:
         args += ["--", path]
     try:
-        diff = _run(Path(repo), args)
+        diff = _run(Path(repo), args, max_bytes=MAX_DIFF_BYTES, truncate_ok=True)
     except GitError:
         return ""
     added = [
@@ -349,6 +405,8 @@ def added_lines_by_file(
         diff = _run(
             Path(repo),
             ["show", "--format=", "--unified=0", "--no-color", *NO_DIFF_PROGRAMS, sha],
+            max_bytes=MAX_DIFF_BYTES,
+            truncate_ok=True,
         )
     except GitError:
         return {}
@@ -371,7 +429,10 @@ def file_blob(repo: str | Path, sha: str, path: str, *, max_bytes: int = 200_000
     """Return file contents at a revision, or an empty string if unavailable."""
     try:
         return _run(
-            Path(repo), ["show", *NO_DIFF_PROGRAMS, f"{sha}:{path}"]
-        )[:max_bytes]
+            Path(repo),
+            ["show", *NO_DIFF_PROGRAMS, f"{sha}:{path}"],
+            max_bytes=max_bytes,
+            truncate_ok=True,
+        )
     except GitError:
         return ""
